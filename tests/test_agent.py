@@ -44,8 +44,3 @@ def test_joint_dense():
     assert values.size() == torch.Size([25])
     assert entropy.size() == torch.Size([])
     assert (entropy - 0.6930).abs() < 0.01
-
-def main():
-    test_joint_dense()
-
-main()

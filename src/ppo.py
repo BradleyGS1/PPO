@@ -74,7 +74,7 @@ class Agent(nn.Module):
         self.critic = self.init_layer(nn.Linear(256, 1), std=1)
 
     def get_values(
-        self, 
+        self,
         states: torch.Tensor
     ):
         if self.joint_net:
@@ -132,6 +132,30 @@ class PPO:
 
         self.agent = None
 
+    def episode_advantages(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor
+    ):
+        ep_size = rewards.size(0)
+
+        td_residuals = rewards + self.discount_factor * values[1:] - values[:-1]
+        td_residuals = td_residuals.cpu()
+
+        ep_advantages = torch.zeros(size=(ep_size,), dtype=torch.float32, device="cpu")
+        ep_advantages[-1] = td_residuals[-1]
+
+        gae_factor = self.gae_factor
+        discount_factor = self.discount_factor
+
+        for i in range(ep_size-2, -1, -1):
+            ep_advantages[i] = td_residuals[i] + gae_factor * discount_factor * ep_advantages[i+1]
+
+        if torch.cuda.is_available():
+            ep_advantages = ep_advantages.cuda()
+
+        return ep_advantages
+
     def compute_losses(
         self,
         prob_ratios: torch.Tensor,
@@ -152,7 +176,7 @@ class PPO:
         # Policy loss, note the negative sign infront for gradient ascent
         policy_loss = -1.0 * torch.minimum(weighted_advantages, clipped_advantages).mean()
 
-        # Critic loss, with or without value function loss clipping. Andrychowicz, et al. (2021) suggests value 
+        # Critic loss, with or without value function loss clipping. Andrychowicz, et al. (2021) suggests value
         # function loss clipping actually hurts performance.
         if self.clip_va_loss:
             squared_error = (returns - curr_values) ** 0.5
