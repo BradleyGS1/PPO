@@ -131,6 +131,7 @@ class PPO:
         self.joint_network = joint_network
 
         self.agent = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def episode_advantages(
         self,
@@ -151,10 +152,46 @@ class PPO:
         for i in range(ep_size-2, -1, -1):
             ep_advantages[i] = td_residuals[i] + gae_factor * discount_factor * ep_advantages[i+1]
 
-        if torch.cuda.is_available():
-            ep_advantages = ep_advantages.cuda()
-
+        ep_advantages = ep_advantages.to(self.device)
         return ep_advantages
+
+    def compute_advantages(
+        self,
+        rewards: torch.Tensor,
+        values: torch.Tensor,
+        end_values: torch.Tensor,
+        done_flags: torch.Tensor,
+        trunc_flags: torch.Tensor
+    ):
+        num_rewards = rewards.size(0)
+        advantages = torch.zeros(size=(num_rewards,), dtype=torch.float32, device=self.device)
+
+        num_advantages = 0
+        ep_start_idx = 0
+        ep_count = 0
+        for i in range(num_rewards):
+            done = done_flags[i]
+            trunc = trunc_flags[i]
+
+            if done + trunc > 0:
+                end_value = torch.tensor([0.0], dtype=torch.float32, device=self.device)
+                if trunc > 0:
+                    end_value += end_values[ep_count]
+
+                ep_rewards = rewards[ep_start_idx:i+1]
+                ep_values = torch.concat([values[ep_start_idx:i+1], end_value])
+
+                ep_size = ep_rewards.size(0)
+                ep_advantages = self.episode_advantages(ep_rewards, ep_values)
+
+                for j in range(ep_size):
+                    advantages[num_advantages] = ep_advantages[j]
+                    num_advantages += 1
+
+                ep_start_idx = i + 1
+                ep_count += 1
+
+        return advantages
 
     def compute_losses(
         self,
