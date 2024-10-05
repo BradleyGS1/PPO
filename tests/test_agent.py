@@ -9,21 +9,21 @@ from ppo import Agent
 
 def test_joint_dense():
     agent = Agent(state_shape=(6,), action_shape=(2,), conv_net=False, joint_net=True)
-    states = torch.normal(mean=0.5, std=1.0, size=(6,))
+    states = torch.normal(mean=0.5, std=1.0, size=(6,), device="cuda")
     values = agent.get_values(states)
 
     assert values.size() == torch.Size([1])
 
 
     agent = Agent(state_shape=(4,), action_shape=(4,), conv_net=False, joint_net=True)
-    states = torch.normal(mean=1.5, std=0.2, size=(2, 4))
+    states = torch.normal(mean=1.5, std=0.2, size=(2, 4), device="cuda")
     values = agent.get_values(states)
 
     assert values.size() == torch.Size([2, 1])
 
 
     agent = Agent(state_shape=(8,), action_shape=(6,), conv_net=False, joint_net=True)
-    states = torch.normal(mean=0.0, std=1.0, size=(4, 8))
+    states = torch.normal(mean=0.0, std=1.0, size=(4, 8), device="cuda")
     actions, log_probs, values, entropy = agent.get_actions_and_values(states, actions=None)
 
     assert actions.size() == torch.Size([4])
@@ -33,8 +33,8 @@ def test_joint_dense():
 
 
     agent = Agent(state_shape=(2,), action_shape=(2,), conv_net=False, joint_net=True)
-    states = torch.normal(mean=0.0, std=1.0, size=(25, 2))
-    actions = torch.randint(low=0, high=2, size=(25,))
+    states = torch.normal(mean=0.0, std=1.0, size=(25, 2), device="cuda")
+    actions = torch.randint(low=0, high=2, size=(25,), device="cuda")
     actions_result, log_probs, values, entropy = agent.get_actions_and_values(states, actions=actions)
 
     assert actions.size() == torch.Size([25])
