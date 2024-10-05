@@ -8,6 +8,10 @@ import gymnasium as gym
 import ray
 import wandb
 import time
+import tqdm
+
+from datetime import datetime
+
 
 class Agent(nn.Module):
     def __init__(
@@ -47,7 +51,7 @@ class Agent(nn.Module):
             self.init_layer(nn.Linear(64 * 7 * 7, 512)),
             nn.ReLU(),
         )
-        if self.joint_net:
+        if not self.joint_net:
             self.va_backbone = nn.Sequential(
                 self.init_layer(nn.Conv2d(4, 32, 8, stride=4)),
                 nn.ReLU(),
@@ -69,9 +73,9 @@ class Agent(nn.Module):
             self.init_layer(nn.Linear(64, 64)),
             nn.Tanh()
         )
-        if self.joint_net:
+        if not self.joint_net:
             self.va_backbone = nn.Sequential(
-                self.init_layer(nn.Linear(4, 64)),
+                self.init_layer(nn.Linear(self.state_shape[0], 64)),
                 nn.Tanh(),
                 self.init_layer(nn.Linear(64, 64)),
                 nn.Tanh()
@@ -139,11 +143,16 @@ class ActorEnv:
     def reset(self):
         self.state, _ = self.env.reset()
         self.state = np.float32(self.state)
+        if len(self.state.shape) == 3:
+            self.state = np.permute_dims(self.state, axes=(2, 0, 1))
         return 1
 
     def step(self, action: np.ndarray):
+        action = np.squeeze(action)
         self.state, reward, done, trunc, info = self.env.step(action)
         self.state = np.float32(self.state)
+        if len(self.state.shape) == 3:
+            self.state = np.permute_dims(self.state, axes=(2, 0, 1))
         reward = np.float32(reward)
         done = np.int32(done)
         trunc = np.int32(trunc)
@@ -197,7 +206,7 @@ class VecEnv:
             truncs[i] = trunc
 
             if "episode" in info:
-                ep_return = info["episode"]["r"]
+                ep_return = info["episode"]["r"].item()
                 roll_ep_returns = self.rolling_ep_returns[i]
 
                 if len(roll_ep_returns) == 10:
@@ -251,7 +260,7 @@ class VecEnv:
                 self.total_return += reward.cpu().numpy()
 
                 can_reset = True
-                if t_step == self.steps_per_env - 1:
+                if done + trunc == 0 and t_step == self.steps_per_env - 1:
                     can_reset = False
                     trunc += 1
 
@@ -291,7 +300,7 @@ class VecEnv:
             end_idx = cum_counts[actor] + order
             self.end_states[end_idx] = end_state
 
-        ep_returns_stack = np.hstack(self.rolling_ep_returns)
+        ep_returns_stack = np.concatenate(self.rolling_ep_returns)
         if len(ep_returns_stack) > 0:
             self.mean_ep_return = np.mean(ep_returns_stack, dtype=np.float32)
             self.lower_ep_return, self.upper_ep_return = np.percentile(
@@ -319,6 +328,8 @@ class PPO:
         self.pi_optimizer: optim.optimizer.Optimizer = None
         self.va_optimizer: optim.optimizer.Optimizer = None
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.updates = 0
 
     def episode_advantages(
         self,
@@ -405,14 +416,14 @@ class PPO:
         if self.clip_va_loss:
             squared_error = (returns - curr_values) ** 0.5
             clipped_values = torch.clamp(curr_values, prev_values-clip_ratio, prev_values+clip_ratio)
-            clipped_error = (returns - clipped_values) ** 0.5
+            clipped_error = (returns - clipped_values) ** 2
             value_loss = 0.5 * torch.maximum(squared_error, clipped_error).mean()
         else:
-            value_loss = 0.5 * ((returns - curr_values) ** 0.5).mean()
+            value_loss = 0.5 * ((returns - curr_values) ** 2).mean()
 
         with torch.no_grad():
             # Compute proportion of data that gets clipped
-            clip_frac = ((prob_ratios - 1).abs() > clip_ratio).mean()
+            clip_frac = ((prob_ratios - 1).abs() > clip_ratio).float().mean()
 
             # Compute KL Divergence approximation http://joschu.net/blog/kl-approx.html
             kl_div = (prob_ratios - 1 - prob_ratios.log()).mean()
@@ -451,8 +462,9 @@ class PPO:
         values = vec_env.values
         done_flags = vec_env.done_flags
         trunc_flags = vec_env.trunc_flags
-        advantages = self.compute_advantages(
-            rewards, values, end_values, done_flags, trunc_flags)
+        with torch.no_grad():
+            advantages = self.compute_advantages(
+                rewards, values, end_values, done_flags, trunc_flags)
 
         # Perform multiple epochs of updates using the gathered data
         updates_start = time.time()
@@ -460,14 +472,15 @@ class PPO:
         grad_steps_done = 0
         for epoch in range(num_epochs):
             data_size = steps_per_env * num_envs
-            shuffled_indices = torch.randperm(data_size)
+            batch_indices = np.arange(data_size)
+            np.random.shuffle(batch_indices)
 
-            num_batches = torch.ceil(data_size / batch_size).item()
+            num_batches = np.int32(np.ceil(data_size / batch_size)).item()
             for start in range(0, data_size, num_batches):
 
                 # Gather a shuffled minibatch from the total data batch
-                end = torch.minimum(data_size, start + batch_size).item()
-                mb_indices = shuffled_indices[start:end]
+                end = np.minimum(data_size, start + batch_size).item()
+                mb_indices = batch_indices[start:end]
 
                 mb_states = vec_env.states[mb_indices]
                 mb_actions = vec_env.actions[mb_indices]
@@ -496,19 +509,19 @@ class PPO:
                     nn.utils.clip_grad_norm_(self.agent.parameters(), max_grad_norm)
                     self.pi_optimizer.step()
                 else:
-                    policy_loss = policy_loss - entropy_coef * entropy
-                    policy_loss = policy_loss * lr_anneal
+                    full_policy_loss = policy_loss - entropy_coef * entropy
+                    full_policy_loss = full_policy_loss * lr_anneal
 
                     self.pi_optimizer.zero_grad()
-                    policy_loss.backward()
+                    full_policy_loss.backward(retain_graph=True)
                     nn.utils.clip_grad_norm_(self.agent.parameters(), max_grad_norm)
                     self.pi_optimizer.step()
 
                     critic_loss = critic_coef * critic_loss
-                    critic_loss = critic_loss * lr_anneal
+                    full_critic_loss = critic_loss * lr_anneal
 
                     self.va_optimizer.zero_grad()
-                    critic_loss.backward()
+                    full_critic_loss.backward()
                     nn.utils.clip_grad_norm_(self.agent.parameters(), max_grad_norm)
                     self.va_optimizer.step()
 
@@ -532,23 +545,114 @@ class PPO:
         ep_return_mean = vec_env.mean_ep_return.item()
         ep_return_lower = vec_env.lower_ep_return.item()
         ep_return_upper = vec_env.upper_ep_return.item()
+        ep_return_data = (ep_return_lower, ep_return_mean, ep_return_upper)
 
         if wandb.run is not None:
             wandb.log({
                 "utils/ep_return_mean": ep_return_mean,
-                "utils/ep_return_lower": ep_return_lower,
-                "utils/ep_return_upper": ep_return_upper,
+                "utils/ep_return_0.05": ep_return_lower,
+                "utils/ep_return_0.95": ep_return_upper,
                 "utils/env_steps_per_sec": env_steps_per_sec,
                 "utils/grad_steps_per_sec": grad_steps_per_sec,
-                "metrics/policy_loss": policy_loss,
-                "metrics/critic_loss": critic_loss,
-                "metrics/entropy": entropy,
+                "losses/policy_loss": policy_loss,
+                "losses/critic_loss": critic_loss,
+                "losses/entropy": entropy,
                 "metrics/clip_frac": clip_frac,
                 "metrics/kl_div": kl_div,
-                "metrics/ep_return": wandb.Table(
-                    data=[[ep_return_mean, ep_return_lower, ep_return_upper]],
-                    columns=["episode_return", "ep_return_0.05", "ep_return_0.95"]
-                )
-            }, step=steps_per_env*num_envs)
+                "metrics/roll_return": rollout_return,
+                "metrics/ep_return": ep_return_mean
+            }, step=self.updates*steps_per_env*num_envs)
 
-        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_mean
+        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_data
+
+    def train(
+        self,
+        env_fn: callable,
+        num_updates: int,
+        num_envs: int,
+        steps_per_env: int,
+        num_epochs: int,
+        batch_size: int,
+        critic_coef: float,
+        entropy_coef: float,
+        clip_ratio: float,
+        target_div: float,
+        max_grad_norm: float,
+        learning_rate: float,
+        early_stop_reward: float = None
+    ):
+        test_env = env_fn()
+        state_shape = test_env.reset()[0].shape
+        action_shape = [test_env.action_space.n] # temporary
+        self.agent = Agent(state_shape, action_shape, conv_net=self.conv_net, joint_net=self.joint_network)
+
+        del test_env
+        vec_env = VecEnv(env_fn, num_envs=num_envs, steps_per_env=steps_per_env, agent=self.agent)
+
+        self.pi_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
+        self.va_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
+        lr_anneal = 1.0
+
+        curr_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M")
+        wandb.init(project=f"exp-ppo-{curr_datetime}", config={
+            "discount_factor": self.discount_factor,
+            "gae_factor": self.gae_factor,
+            "norm_adv": self.norm_adv,
+            "clip_va_loss": self.clip_va_loss,
+            "joint_network": self.joint_network,
+            "num_updates": num_updates,
+            "num_envs": num_envs,
+            "steps_per_env": steps_per_env,
+            "num_epochs": num_epochs,
+            "batch_size": batch_size,
+            "critic_coef": critic_coef,
+            "entropy_coef": entropy_coef,
+            "clip_ratio": clip_ratio,
+            "target_div": target_div,
+            "max_grad_norm": max_grad_norm,
+            "learning_rate": learning_rate,
+            "early_stop_reward": early_stop_reward
+        })
+
+        ep_return_data_list = []
+
+        early_stop_count = 0
+        pbar = tqdm.trange(num_updates, leave=True)
+        for update in pbar:
+            pi_loss, va_loss, entropy, clip_frac, kl_div, roll_return, ep_return_data = self.train_step(
+                vec_env, num_epochs, batch_size, critic_coef, entropy_coef, 
+                clip_ratio, target_div, max_grad_norm, lr_anneal
+            )
+
+            wandb.log({
+                "params/learning_rate": learning_rate * lr_anneal,
+            }, step=self.updates*steps_per_env*num_envs, commit=True)
+
+            ep_return = ep_return_data[1]
+            ep_return_data_list.append(ep_return_data)
+
+            lr_anneal -= 0.999 / (num_updates - 1)
+            self.updates += 1
+
+            pbar.set_postfix({
+                "pi_loss": f"{pi_loss:.3f}", "va_loss": f"{va_loss:.3f}",
+                "entropy": f"{entropy:.3f}", "return": f"{roll_return:.3f}",
+                "ep_return": f"{ep_return:.3f}", "kl_div": f"{kl_div:.4f}",
+                "clip_frac": f"{clip_frac:.3f}"
+            })
+
+            if early_stop_reward is not None and ep_return >= early_stop_reward:
+                early_stop_count += 1
+                if early_stop_count == 3:
+                    pbar.close()
+                    print("Early stop reward reached.")
+                    break
+            else:
+                early_stop_count = 0
+
+        wandb.log({"utils/ep_return_table": wandb.Table(
+            columns=["ep_return_0.05", "ep_return", "ep_return_0.95"],
+            data=ep_return_data_list)})
+
+        wandb.finish()
+
