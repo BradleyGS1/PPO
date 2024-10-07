@@ -5,11 +5,11 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 import gymnasium as gym
-import ray
 import wandb
 import time
 import tqdm
 
+from typing import Callable
 from datetime import datetime
 
 
@@ -95,7 +95,7 @@ class Agent(nn.Module):
             hidden = self.va_backbone(states)
             values = self.critic(hidden)
 
-        return values
+        return torch.flatten(values)
 
     def get_actions_and_values(
         self,
@@ -123,51 +123,16 @@ class Agent(nn.Module):
 
         return actions, log_probs, values, entropy
 
-@ray.remote(num_cpus=1, num_gpus=0)
-class ActorEnv:
+class SyncVecEnv:
     def __init__(
         self,
-        env_fn: callable,
-        actor_id: int
-    ):
-        self.env: gym.Env = env_fn()
-        self.actor_id = actor_id
-        self.reset()
-
-    def get_spaces(self):
-        return self.state.shape, self.env.action_space
-
-    def get_state(self):
-        return self.state
-
-    def reset(self):
-        self.state, _ = self.env.reset()
-        self.state = np.float32(self.state)
-        if len(self.state.shape) == 3:
-            self.state = np.permute_dims(self.state, axes=(2, 0, 1))
-        return 1
-
-    def step(self, action: np.ndarray):
-        action = np.squeeze(action)
-        self.state, reward, done, trunc, info = self.env.step(action)
-        self.state = np.float32(self.state)
-        if len(self.state.shape) == 3:
-            self.state = np.permute_dims(self.state, axes=(2, 0, 1))
-        reward = np.float32(reward)
-        done = np.int32(done)
-        trunc = np.int32(trunc)
-        return reward, done, trunc, info
-
-class VecEnv:
-    def __init__(
-        self,
-        env_fn: callable,
+        env_fn: Callable[[], gym.Env],
         num_envs: int,
         steps_per_env: int,
         agent: Agent
     ):
+        self.envs = [env_fn() for _ in range(num_envs)]
         self.num_envs = num_envs
-        self.envs = [ActorEnv.remote(env_fn, agent_id) for agent_id in range(num_envs)]
         self.steps_per_env = steps_per_env
         self.agent = agent
 
@@ -176,34 +141,65 @@ class VecEnv:
         self.lower_ep_return = np.float32(np.nan)
         self.upper_ep_return = np.float32(np.nan)
 
-        self.state_shape, self.action_space = ray.get(self.envs[0].get_spaces.remote())
+        state, _ = self.envs[0].reset()
+        self.state_shape = state.shape
+        self.action_space = self.envs[0].action_space
         if isinstance(self.action_space, gym.spaces.Discrete):
             self.action_dtype = torch.int32
         else:
             self.action_dtype = torch.float32
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if len(self.state_shape) < 3:
+            self.permute_state_fn = lambda x: x
+        else:
+            self.permute_state_fn = self.permute_state
+            new_state_shape = (self.state_shape[2], self.state_shape[0], self.state_shape[1])
+            self.state_shape = new_state_shape
 
-    def vec_env_states(self):
-        states = ray.get([env.get_state.remote() for env in self.envs])
-        states = torch.tensor(np.stack(states, axis=0), dtype=torch.float32, device=self.device)
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.t_states = self.vec_reset()
+
+    def permute_state(self, state: np.ndarray):
+        return np.permute_dims(state, axes=(2, 0, 1))
+
+    def close(self):
+        self.envs = None
+
+    def vec_reset(self) -> torch.Tensor:
+        states = torch.zeros(size=(self.num_envs, *self.state_shape), dtype=torch.float32, device=self.device)
+        for i, env in enumerate(self.envs):
+            state = env.reset()[0]
+            state = self.permute_state_fn(state)
+            state = torch.tensor(state, dtype=torch.float32, device=self.device)
+            states[i] = state
         return states
 
-    def vec_env_step(self, actions: torch.Tensor):
-        rewards = np.zeros(shape=(self.num_envs,), dtype=np.float32)
-        dones = np.zeros(shape=(self.num_envs,), dtype=np.int32)
-        truncs = np.zeros(shape=(self.num_envs,), dtype=np.int32)
+    def env_reset(self, env_id: int):
+        env = self.envs[env_id]
+        state = env.reset()[0]
+        state = self.permute_state_fn(state)
+        state = torch.tensor(state, dtype=torch.float32, device=self.device)
+        return state
 
-        step_processes = []
-        for env, action in zip(self.envs, actions.cpu()):
-            step_processes.append(env.step.remote(action.numpy()))
+    def vec_step(
+        self, 
+        actions: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        
+        actions = actions.cpu().numpy()
 
-        step_data = ray.get(step_processes)
-        for i, actor_data in enumerate(step_data):
-            reward, done, trunc, info = actor_data
-            rewards[i] = reward
-            dones[i] = done
-            truncs[i] = trunc
+        states = torch.zeros(size=(self.num_envs, *self.state_shape), dtype=torch.float32, device=self.device)
+        rewards = torch.zeros(size=(self.num_envs, ), dtype=torch.float32, device=self.device)
+        done_flags = torch.zeros(size=(self.num_envs, ), dtype=torch.int32, device=self.device)
+        trunc_flags = torch.zeros(size=(self.num_envs, ), dtype=torch.int32, device=self.device)
+        for i, env in enumerate(self.envs):
+            action = np.squeeze(actions[i])
+            state, reward, done, trunc, info = env.step(action)
+            state = self.permute_state_fn(state)
+            states[i] = torch.tensor(state, dtype=torch.float32, device=self.device)
+            rewards[i] = torch.tensor(reward, dtype=torch.float32, device=self.device)
+            done_flags[i] = torch.tensor(done, dtype=torch.int32, device=self.device)
+            trunc_flags[i] = torch.tensor(trunc, dtype=torch.int32, device=self.device)
 
             if "episode" in info:
                 ep_return = info["episode"]["r"].item()
@@ -213,99 +209,75 @@ class VecEnv:
                     roll_ep_returns.pop(0)
                 roll_ep_returns.append(ep_return)
 
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
-        dones = torch.tensor(dones, dtype=torch.int32, device=self.device)
-        truncs = torch.tensor(truncs, dtype=torch.int32, device=self.device)
-
-        return rewards, dones, truncs
+        return states, rewards, done_flags, trunc_flags
 
     def rollout(self):
-        data_size = self.steps_per_env * self.num_envs
-        self.states = torch.zeros(size=(data_size, *self.state_shape), dtype=torch.float32, device=self.device)
-        self.actions = torch.zeros(size=(data_size, ), dtype=self.action_dtype, device=self.device)
-        self.rewards = torch.zeros(size=(data_size, ), dtype=torch.float32, device=self.device)
-        self.done_flags = torch.zeros(size=(data_size, ), dtype=torch.int32, device=self.device)
-        self.trunc_flags = torch.zeros(size=(data_size, ), dtype=torch.int32, device=self.device)
-        self.values = torch.zeros(size=(data_size, ), dtype=torch.float32, device=self.device)
-        self.log_probs = torch.zeros(size=(data_size, ), dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            num_steps = self.steps_per_env
+            num_envs = self.num_envs
 
-        end_states_unordered = []
-        end_states_ordering = []
+            self.states = torch.zeros(size=(num_steps, num_envs, *self.state_shape), dtype=torch.float32, device=self.device)
+            self.actions = torch.zeros(size=(num_steps, num_envs, ), dtype=self.action_dtype, device=self.device)
+            self.rewards = torch.zeros(size=(num_steps, num_envs, ), dtype=torch.float32, device=self.device)
+            self.done_flags = torch.zeros(size=(num_steps, num_envs, ), dtype=torch.int32, device=self.device)
+            self.trunc_flags = torch.zeros(size=(num_steps, num_envs, ), dtype=torch.int32, device=self.device)
+            self.values = torch.zeros(size=(num_steps, num_envs, ), dtype=torch.float32, device=self.device)
+            self.log_probs = torch.zeros(size=(num_steps, num_envs, ), dtype=torch.float32, device=self.device)
 
-        ep_counts = np.zeros(shape=(self.num_envs,), dtype=np.int32)
-        self.total_return = np.float32(0.0)
+            end_states = [[] for _ in range(num_envs)]
+            self.ep_counts = torch.zeros(size=(self.num_envs, ), dtype=torch.int32, device=self.device)
+            self.total_return = np.float32(0.0)
 
-        for t_step in range(self.steps_per_env):
-            # Get states from all envs
-            t_states = self.vec_env_states()
+            for t_step in range(self.steps_per_env):
 
-            # Compute actions, log_probs and critic values for each env using their states
-            with torch.no_grad():
-                t_actions, t_log_probs, t_values, _  = self.agent.get_actions_and_values(t_states, actions=None)
+                # Compute actions, log_probs and critic values for each env using their states
+                t_actions, t_log_probs, t_values, _  = self.agent.get_actions_and_values(self.t_states, actions=None)
 
-            # Perform a vector env step using the sampled actions
-            t_rewards, t_dones, t_truncs = self.vec_env_step(t_actions)
+                # Perform a vector env step using the sampled actions
+                t_new_states, t_rewards, t_dones, t_truncs = self.vec_step(t_actions)
 
-            for actor in range(self.num_envs):
-                env = self.envs[actor]
+                for actor in range(self.num_envs):
+                    reward = t_rewards[actor]
+                    done = t_dones[actor]
+                    trunc = t_truncs[actor]
+                    terminated = done + trunc
 
-                state = t_states[actor]
-                action = t_actions[actor]
-                reward = t_rewards[actor]
-                done = t_dones[actor]
-                trunc = t_truncs[actor]
-                value = t_values[actor]
-                log_prob = t_log_probs[actor]
+                    self.total_return += reward.cpu().numpy()
 
-                self.total_return += reward.cpu().numpy()
+                    can_reset = True
+                    if terminated == 0 and t_step == self.steps_per_env - 1:
+                        terminated += 1
+                        t_truncs[actor] += 1
+                        can_reset = False
 
-                can_reset = True
-                if done + trunc == 0 and t_step == self.steps_per_env - 1:
-                    can_reset = False
-                    trunc += 1
+                    if terminated > 0:
+                        end_state = t_new_states[actor]
+                        end_states[actor].append(end_state.cpu())
 
-                if done + trunc > 0:
-                    end_state = torch.tensor(ray.get(env.get_state.remote()), dtype=torch.float32, device="cpu")
-                    end_states_unordered.append(end_state)
+                        if can_reset:
+                            t_new_states[actor] = self.env_reset(actor)
 
-                    ep_count = ep_counts[actor]
-                    end_state_order = np.array([actor, ep_count], dtype=np.int32)
-                    end_states_ordering.append(end_state_order)
+                        self.ep_counts[actor] += 1
 
-                    if can_reset:
-                        ray.get(env.reset.remote())
+                self.states[t_step] = self.t_states
+                self.actions[t_step] = t_actions
+                self.rewards[t_step] = t_rewards
+                self.done_flags[t_step] = t_dones
+                self.trunc_flags[t_step] = t_truncs
+                self.values[t_step] = t_values
+                self.log_probs[t_step] = t_log_probs
 
-                    ep_counts[actor] += 1
-
-                data_idx = t_step + self.steps_per_env * actor
-                self.states[data_idx] = state
-                self.actions[data_idx] = action
-                self.rewards[data_idx] = reward
-                self.done_flags[data_idx] = done
-                self.trunc_flags[data_idx] = trunc
-                self.values[data_idx] = value
-                self.log_probs[data_idx] = log_prob
+                self.t_states = t_new_states
 
         self.states.requires_grad = True
-
-        num_ends = np.sum(ep_counts).item()
-        cum_counts = np.cumsum(ep_counts) - ep_counts
-        self.end_states = torch.zeros(size=(num_ends, *self.state_shape), dtype=torch.float32, device=self.device)
-
-        for i in range(num_ends):
-            end_state = end_states_unordered[i]
-            actor = end_states_ordering[i][0]
-            order = end_states_ordering[i][1]
-
-            end_idx = cum_counts[actor] + order
-            self.end_states[end_idx] = end_state
+        end_states_tensors = [torch.stack(actor_end_states, dim=0) for actor_end_states in end_states]
+        self.end_states = torch.concatenate(end_states_tensors, dim=0).to(device=self.device)
 
         ep_returns_stack = np.concatenate(self.rolling_ep_returns)
         if len(ep_returns_stack) > 0:
             self.mean_ep_return = np.mean(ep_returns_stack, dtype=np.float32)
             self.lower_ep_return, self.upper_ep_return = np.percentile(
                 ep_returns_stack, [5.0, 95.0])
-
 class PPO:
     def __init__(
         self,
@@ -337,57 +309,55 @@ class PPO:
         values: torch.Tensor
     ):
         ep_size = rewards.size(0)
-
-        td_residuals = rewards + self.discount_factor * values[1:] - values[:-1]
-        td_residuals = td_residuals.cpu()
-
-        ep_advantages = torch.zeros(size=(ep_size,), dtype=torch.float32, device="cpu")
-        ep_advantages[-1] = td_residuals[-1]
-
         gae_factor = self.gae_factor
         discount_factor = self.discount_factor
+
+        td_residuals = rewards + discount_factor * values[1:] - values[:-1]
+
+        ep_advantages = torch.zeros(size=(ep_size,), dtype=torch.float32, device=self.device)
+        ep_advantages[-1] = td_residuals[-1]
 
         for i in range(ep_size-2, -1, -1):
             ep_advantages[i] = td_residuals[i] + gae_factor * discount_factor * ep_advantages[i+1]
 
-        ep_advantages = ep_advantages.to(self.device)
         return ep_advantages
 
     def compute_advantages(
         self,
         rewards: torch.Tensor,
         values: torch.Tensor,
-        end_values: torch.Tensor,
+        end_states: torch.Tensor,
+        ep_counts: torch.Tensor,
         done_flags: torch.Tensor,
         trunc_flags: torch.Tensor
     ):
-        num_rewards = rewards.size(0)
-        advantages = torch.zeros(size=(num_rewards,), dtype=torch.float32, device=self.device)
+        num_steps = rewards.size(0)
+        num_agents = rewards.size(1)
 
-        num_advantages = 0
-        ep_start_idx = 0
-        ep_count = 0
-        for i in range(num_rewards):
-            done = done_flags[i]
-            trunc = trunc_flags[i]
+        advantages = torch.zeros_like(rewards, dtype=torch.float32, device=self.device)
+        end_values = self.agent.get_values(end_states)
 
-            if done + trunc > 0:
-                end_value = torch.tensor([0.0], dtype=torch.float32, device=self.device)
-                if trunc > 0:
-                    end_value += end_values[ep_count]
+        discount_factor = self.discount_factor
+        gae_factor = self.gae_factor
 
-                ep_rewards = rewards[ep_start_idx:i+1]
-                ep_values = torch.concat([values[ep_start_idx:i+1], end_value])
+        end_indices = torch.cumsum(ep_counts, dim=0) - 1
+        next_values = torch.zeros(size=(num_agents,), dtype=torch.float32, device=self.device)
+        next_advantages = torch.zeros(size=(num_agents,), dtype=torch.float32, device=self.device)
 
-                ep_size = ep_rewards.size(0)
-                ep_advantages = self.episode_advantages(ep_rewards, ep_values)
+        for t in reversed(range(num_steps)):
+            dones = done_flags[t]
+            truncs = trunc_flags[t]
+            terminations = dones + truncs
 
-                for j in range(ep_size):
-                    advantages[num_advantages] = ep_advantages[j]
-                    num_advantages += 1
+            next_values = (1 - terminations) * next_values + truncs * end_values[end_indices]
+            next_advantages = (1 - terminations) * next_advantages
+            end_indices = end_indices - terminations
 
-                ep_start_idx = i + 1
-                ep_count += 1
+            td_residuals = rewards[t] + discount_factor * next_values - values[t]
+            advantages[t] = td_residuals + discount_factor * gae_factor * next_advantages
+
+            next_values = values[t]
+            next_advantages = advantages[t]
 
         return advantages
 
@@ -432,7 +402,7 @@ class PPO:
 
     def train_step(
         self,
-        vec_env: VecEnv,
+        vec_env: SyncVecEnv,
         num_epochs: int,
         batch_size: int,
         critic_coef: float,
@@ -449,22 +419,25 @@ class PPO:
         rollout_start = time.time()
         vec_env.rollout()
 
-        rollout_time = time.time() - rollout_start
-        env_steps_per_sec = steps_per_env * num_envs / rollout_time
-
-        # Calculate critic values for termination states
-        end_states = vec_env.end_states
-        with torch.no_grad():
-            end_values = self.agent.get_values(end_states)
-
         # Calculate the advantages
         rewards = vec_env.rewards
         values = vec_env.values
+        end_states = vec_env.end_states
+        ep_counts = vec_env.ep_counts
         done_flags = vec_env.done_flags
         trunc_flags = vec_env.trunc_flags
         with torch.no_grad():
             advantages = self.compute_advantages(
-                rewards, values, end_values, done_flags, trunc_flags)
+                rewards, values, end_states, ep_counts, done_flags, trunc_flags)
+
+        rollout_time = time.time() - rollout_start
+        env_steps_per_sec = steps_per_env * num_envs / rollout_time
+
+        states = vec_env.states.flatten(0, 1)
+        actions = vec_env.actions.flatten(0, 1)
+        log_probs = vec_env.log_probs.flatten(0, 1)
+        values = vec_env.values.flatten(0, 1)
+        advantages = advantages.flatten(0, 1)
 
         # Perform multiple epochs of updates using the gathered data
         updates_start = time.time()
@@ -475,17 +448,16 @@ class PPO:
             batch_indices = np.arange(data_size)
             np.random.shuffle(batch_indices)
 
-            num_batches = np.int32(np.ceil(data_size / batch_size)).item()
-            for start in range(0, data_size, num_batches):
+            for start in range(0, data_size, batch_size):
 
                 # Gather a shuffled minibatch from the total data batch
                 end = np.minimum(data_size, start + batch_size).item()
                 mb_indices = batch_indices[start:end]
 
-                mb_states = vec_env.states[mb_indices]
-                mb_actions = vec_env.actions[mb_indices]
-                mb_log_probs = vec_env.log_probs[mb_indices]
-                mb_values = vec_env.values[mb_indices]
+                mb_states = states[mb_indices]
+                mb_actions = actions[mb_indices]
+                mb_log_probs = log_probs[mb_indices]
+                mb_values = values[mb_indices]
                 mb_advantages = advantages[mb_indices]
 
                 # Compute the new log probs, critic values and entropy using minibatch states and actions
@@ -534,6 +506,7 @@ class PPO:
 
         updates_time = time.time() - updates_start
         grad_steps_per_sec = grad_steps_done / updates_time
+        global_steps_per_sec = steps_per_env * num_envs / (rollout_time + updates_time)
 
         policy_loss = policy_loss.item()
         critic_loss = critic_loss.item()
@@ -554,6 +527,7 @@ class PPO:
                 "utils/ep_return_0.95": ep_return_upper,
                 "utils/env_steps_per_sec": env_steps_per_sec,
                 "utils/grad_steps_per_sec": grad_steps_per_sec,
+                "utils/global_steps_per_sec": global_steps_per_sec,
                 "losses/policy_loss": policy_loss,
                 "losses/critic_loss": critic_loss,
                 "losses/entropy": entropy,
@@ -587,7 +561,7 @@ class PPO:
         self.agent = Agent(state_shape, action_shape, conv_net=self.conv_net, joint_net=self.joint_network)
 
         del test_env
-        vec_env = VecEnv(env_fn, num_envs=num_envs, steps_per_env=steps_per_env, agent=self.agent)
+        vec_env = SyncVecEnv(env_fn, num_envs, steps_per_env, self.agent)
 
         self.pi_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
         self.va_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
