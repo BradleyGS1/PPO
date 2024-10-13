@@ -11,6 +11,7 @@ import tqdm
 
 from typing import Callable
 from datetime import datetime
+from PIL import Image
 
 
 class Agent(nn.Module):
@@ -139,7 +140,11 @@ class SyncVecEnv:
         self.rolling_ep_returns = [[] for _ in range(num_envs)]
         self.mean_ep_return = np.float32(np.nan)
         self.lower_ep_return = np.float32(np.nan)
+        self.median_ep_return = np.float32(np.nan)
         self.upper_ep_return = np.float32(np.nan)
+
+        self.rolling_ep_lengths = [[] for _ in range(num_envs)]
+        self.mean_ep_length = np.float32(np.nan)
 
         state, _ = self.envs[0].reset()
         self.state_shape = state.shape
@@ -182,10 +187,10 @@ class SyncVecEnv:
         return state
 
     def vec_step(
-        self, 
+        self,
         actions: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        
+
         actions = actions.cpu().numpy()
 
         states = torch.zeros(size=(self.num_envs, *self.state_shape), dtype=torch.float32, device=self.device)
@@ -205,11 +210,38 @@ class SyncVecEnv:
                 ep_return = info["episode"]["r"].item()
                 roll_ep_returns = self.rolling_ep_returns[i]
 
+                ep_length = info["episode"]["l"].item()
+                roll_ep_lengths = self.rolling_ep_lengths[i]
+
                 if len(roll_ep_returns) == 10:
                     roll_ep_returns.pop(0)
                 roll_ep_returns.append(ep_return)
 
+                if len(roll_ep_lengths) == 10:
+                    roll_ep_lengths.pop(0)
+                roll_ep_lengths.append(ep_length)
+
         return states, rewards, done_flags, trunc_flags
+
+    def test_agent(self, render_every: int):
+        num_steps = self.steps_per_env
+        num_envs = self.num_envs
+        self.images = [[] for _ in range(num_envs)]
+
+        t_states = self.vec_reset()
+        pbar = tqdm.trange(num_steps)
+        pbar.set_description_str("Recording")
+        for t_step in pbar:
+
+            if t_step % render_every == 0:
+                for actor in range(num_envs):
+                    state_image = Image.fromarray(self.envs[actor].render(), mode="RGB")
+                    self.images[actor].append(state_image)
+
+            t_actions, _, _, _ = self.agent.get_actions_and_values(t_states, actions=None)
+            t_states, _, _, _ = self.vec_step(t_actions)
+
+        self.vec_reset()
 
     def rollout(self):
         with torch.no_grad():
@@ -228,7 +260,7 @@ class SyncVecEnv:
             self.ep_counts = torch.zeros(size=(self.num_envs, ), dtype=torch.int32, device=self.device)
             self.total_return = np.float32(0.0)
 
-            for t_step in range(self.steps_per_env):
+            for t_step in range(num_steps):
 
                 # Compute actions, log_probs and critic values for each env using their states
                 t_actions, t_log_probs, t_values, _  = self.agent.get_actions_and_values(self.t_states, actions=None)
@@ -245,7 +277,7 @@ class SyncVecEnv:
                     self.total_return += reward.cpu().numpy()
 
                     can_reset = True
-                    if terminated == 0 and t_step == self.steps_per_env - 1:
+                    if terminated == 0 and t_step == num_steps - 1:
                         terminated += 1
                         t_truncs[actor] += 1
                         can_reset = False
@@ -276,8 +308,13 @@ class SyncVecEnv:
         ep_returns_stack = np.concatenate(self.rolling_ep_returns)
         if len(ep_returns_stack) > 0:
             self.mean_ep_return = np.mean(ep_returns_stack, dtype=np.float32)
-            self.lower_ep_return, self.upper_ep_return = np.percentile(
-                ep_returns_stack, [5.0, 95.0])
+            self.lower_ep_return, self.median_ep_return, self.upper_ep_return = np.percentile(
+                ep_returns_stack, [5.0, 50.0, 95.0])
+
+        ep_lengths_stack = np.concatenate(self.rolling_ep_lengths)
+        if len(ep_lengths_stack) > 0:
+            self.mean_ep_length = np.mean(ep_lengths_stack, dtype=np.float32)
+
 class PPO:
     def __init__(
         self,
@@ -302,25 +339,6 @@ class PPO:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.updates = 0
-
-    def episode_advantages(
-        self,
-        rewards: torch.Tensor,
-        values: torch.Tensor
-    ):
-        ep_size = rewards.size(0)
-        gae_factor = self.gae_factor
-        discount_factor = self.discount_factor
-
-        td_residuals = rewards + discount_factor * values[1:] - values[:-1]
-
-        ep_advantages = torch.zeros(size=(ep_size,), dtype=torch.float32, device=self.device)
-        ep_advantages[-1] = td_residuals[-1]
-
-        for i in range(ep_size-2, -1, -1):
-            ep_advantages[i] = td_residuals[i] + gae_factor * discount_factor * ep_advantages[i+1]
-
-        return ep_advantages
 
     def compute_advantages(
         self,
@@ -517,12 +535,14 @@ class PPO:
         rollout_return = vec_env.total_return.item() / num_envs
         ep_return_mean = vec_env.mean_ep_return.item()
         ep_return_lower = vec_env.lower_ep_return.item()
+        ep_return_median = vec_env.median_ep_return.item()
         ep_return_upper = vec_env.upper_ep_return.item()
-        ep_return_data = (ep_return_lower, ep_return_mean, ep_return_upper)
+
+        ep_length_mean = vec_env.mean_ep_length.item()
 
         if wandb.run is not None:
             wandb.log({
-                "utils/ep_return_mean": ep_return_mean,
+                "utils/ep_return_0.50": ep_return_median,
                 "utils/ep_return_0.05": ep_return_lower,
                 "utils/ep_return_0.95": ep_return_upper,
                 "utils/env_steps_per_sec": env_steps_per_sec,
@@ -534,10 +554,11 @@ class PPO:
                 "metrics/clip_frac": clip_frac,
                 "metrics/kl_div": kl_div,
                 "metrics/roll_return": rollout_return,
-                "metrics/ep_return": ep_return_mean
+                "metrics/ep_return": ep_return_mean,
+                "metrics/ep_length": ep_length_mean,
             }, step=self.updates*steps_per_env*num_envs)
 
-        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_data
+        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_mean
 
     def train(
         self,
@@ -588,22 +609,17 @@ class PPO:
             "early_stop_reward": early_stop_reward
         })
 
-        ep_return_data_list = []
-
         early_stop_count = 0
         pbar = tqdm.trange(num_updates, leave=True)
         for update in pbar:
-            pi_loss, va_loss, entropy, clip_frac, kl_div, roll_return, ep_return_data = self.train_step(
-                vec_env, num_epochs, batch_size, critic_coef, entropy_coef, 
+            pi_loss, va_loss, entropy, clip_frac, kl_div, roll_return, ep_return = self.train_step(
+                vec_env, num_epochs, batch_size, critic_coef, entropy_coef,
                 clip_ratio, target_div, max_grad_norm, lr_anneal
             )
 
             wandb.log({
                 "params/learning_rate": learning_rate * lr_anneal,
             }, step=self.updates*steps_per_env*num_envs, commit=True)
-
-            ep_return = ep_return_data[1]
-            ep_return_data_list.append(ep_return_data)
 
             lr_anneal -= 0.999 / (num_updates - 1)
             self.updates += 1
@@ -624,9 +640,20 @@ class PPO:
             else:
                 early_stop_count = 0
 
-        wandb.log({"utils/ep_return_table": wandb.Table(
-            columns=["ep_return_0.05", "ep_return", "ep_return_0.95"],
-            data=ep_return_data_list)})
-
         wandb.finish()
 
+    def create_gif(self, env_fn: Callable[[], gym.Env], num_envs: int, max_steps: int, gif_fn: str, duration: int = 50, render_every: int = 1):
+        vec_env = SyncVecEnv(env_fn, num_envs, max_steps, self.agent)
+        vec_env.test_agent(render_every)
+        images = vec_env.images
+
+        for actor, actor_images in enumerate(images):
+            actor_images[0].save(
+                f"{gif_fn}-{actor}.gif",
+                save_all=True,
+                append_images=actor_images[1:],
+                duration=duration,
+                loop=0
+            )
+
+        return images
