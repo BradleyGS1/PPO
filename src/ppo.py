@@ -137,14 +137,11 @@ class SyncVecEnv:
         self.steps_per_env = steps_per_env
         self.agent = agent
 
-        self.rolling_ep_returns = [[] for _ in range(num_envs)]
-        self.mean_ep_return = np.float32(np.nan)
+        self.max_ep_return = np.float32(np.nan)
         self.lower_ep_return = np.float32(np.nan)
         self.median_ep_return = np.float32(np.nan)
         self.upper_ep_return = np.float32(np.nan)
-
-        self.rolling_ep_lengths = [[] for _ in range(num_envs)]
-        self.mean_ep_length = np.float32(np.nan)
+        self.median_ep_length = np.float32(np.nan)
 
         state, _ = self.envs[0].reset()
         self.state_shape = state.shape
@@ -205,21 +202,6 @@ class SyncVecEnv:
             rewards[i] = torch.tensor(reward, dtype=torch.float32, device=self.device)
             done_flags[i] = torch.tensor(done, dtype=torch.int32, device=self.device)
             trunc_flags[i] = torch.tensor(trunc, dtype=torch.int32, device=self.device)
-
-            if "episode" in info:
-                ep_return = info["episode"]["r"].item()
-                roll_ep_returns = self.rolling_ep_returns[i]
-
-                ep_length = info["episode"]["l"].item()
-                roll_ep_lengths = self.rolling_ep_lengths[i]
-
-                if len(roll_ep_returns) == 10:
-                    roll_ep_returns.pop(0)
-                roll_ep_returns.append(ep_return)
-
-                if len(roll_ep_lengths) == 10:
-                    roll_ep_lengths.pop(0)
-                roll_ep_lengths.append(ep_length)
 
         return states, rewards, done_flags, trunc_flags
 
@@ -305,15 +287,21 @@ class SyncVecEnv:
         end_states_tensors = [torch.stack(actor_end_states, dim=0) for actor_end_states in end_states]
         self.end_states = torch.concatenate(end_states_tensors, dim=0).to(device=self.device)
 
-        ep_returns_stack = np.concatenate(self.rolling_ep_returns)
+        if not hasattr(self.envs[0], "return_queue"):
+            return
+
+        ep_returns_stack = np.concatenate([np.array(env.return_queue).reshape(-1) for env in self.envs])
         if len(ep_returns_stack) > 0:
-            self.mean_ep_return = np.mean(ep_returns_stack, dtype=np.float32)
+            if np.isnan(self.max_ep_return) or np.max(ep_returns_stack) > self.max_ep_return:
+                self.max_ep_return = np.max(ep_returns_stack)
+
             self.lower_ep_return, self.median_ep_return, self.upper_ep_return = np.percentile(
                 ep_returns_stack, [5.0, 50.0, 95.0])
 
-        ep_lengths_stack = np.concatenate(self.rolling_ep_lengths)
+        ep_lengths_stack = np.concatenate([np.array(env.length_queue).reshape(-1) for env in self.envs])
         if len(ep_lengths_stack) > 0:
-            self.mean_ep_length = np.mean(ep_lengths_stack, dtype=np.float32)
+            self.median_ep_length = np.percentile(ep_lengths_stack, 50.0)
+
 
 class PPO:
     def __init__(
@@ -332,6 +320,8 @@ class PPO:
         self.clip_va_loss = clip_va_loss
         self.conv_net = conv_net
         self.joint_network = joint_network
+
+        self.project_name = kwargs.get("project_name", None)
 
         self.agent: Agent = None
         self.pi_optimizer: optim.optimizer.Optimizer = None
@@ -402,7 +392,7 @@ class PPO:
         # Critic loss, with or without value function loss clipping. Andrychowicz, et al. (2021) suggests value
         # function loss clipping actually hurts performance.
         if self.clip_va_loss:
-            squared_error = (returns - curr_values) ** 0.5
+            squared_error = (returns - curr_values) ** 2
             clipped_values = torch.clamp(curr_values, prev_values-clip_ratio, prev_values+clip_ratio)
             clipped_error = (returns - clipped_values) ** 2
             value_loss = 0.5 * torch.maximum(squared_error, clipped_error).mean()
@@ -533,12 +523,12 @@ class PPO:
         kl_div = kl_div.item()
 
         rollout_return = vec_env.total_return.item() / num_envs
-        ep_return_mean = vec_env.mean_ep_return.item()
+        ep_return_max = vec_env.max_ep_return.item()
         ep_return_lower = vec_env.lower_ep_return.item()
         ep_return_median = vec_env.median_ep_return.item()
         ep_return_upper = vec_env.upper_ep_return.item()
 
-        ep_length_mean = vec_env.mean_ep_length.item()
+        ep_length_median = vec_env.median_ep_length.item()
 
         if wandb.run is not None:
             wandb.log({
@@ -554,15 +544,15 @@ class PPO:
                 "metrics/clip_frac": clip_frac,
                 "metrics/kl_div": kl_div,
                 "metrics/roll_return": rollout_return,
-                "metrics/ep_return": ep_return_mean,
-                "metrics/ep_length": ep_length_mean,
+                "metrics/ep_return_max": ep_return_max,
+                "metrics/ep_length_0.50": ep_length_median,
             }, step=self.updates*steps_per_env*num_envs)
 
-        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_mean
+        return policy_loss, critic_loss, entropy, clip_frac, kl_div, rollout_return, ep_return_max
 
     def train(
         self,
-        env_fn: callable,
+        env_fn: Callable[[], gym.Env],
         num_updates: int,
         num_envs: int,
         steps_per_env: int,
@@ -589,7 +579,10 @@ class PPO:
         lr_anneal = 1.0
 
         curr_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M")
-        wandb.init(project=f"exp-ppo-{curr_datetime}", config={
+        if self.project_name is None:
+            self.project_name = f"ppo_exp_{curr_datetime}"
+
+        wandb.init(project=self.project_name, name=f"run-{curr_datetime}", reinit=True, config={
             "discount_factor": self.discount_factor,
             "gae_factor": self.gae_factor,
             "norm_adv": self.norm_adv,
@@ -609,10 +602,9 @@ class PPO:
             "early_stop_reward": early_stop_reward
         })
 
-        early_stop_count = 0
         pbar = tqdm.trange(num_updates, leave=True)
         for update in pbar:
-            pi_loss, va_loss, entropy, clip_frac, kl_div, roll_return, ep_return = self.train_step(
+            pi_loss, va_loss, entropy, clip_frac, kl_div, roll_return, ep_return_max = self.train_step(
                 vec_env, num_epochs, batch_size, critic_coef, entropy_coef,
                 clip_ratio, target_div, max_grad_norm, lr_anneal
             )
@@ -627,18 +619,14 @@ class PPO:
             pbar.set_postfix({
                 "pi_loss": f"{pi_loss:.3f}", "va_loss": f"{va_loss:.3f}",
                 "entropy": f"{entropy:.3f}", "return": f"{roll_return:.3f}",
-                "ep_return": f"{ep_return:.3f}", "kl_div": f"{kl_div:.4f}",
+                "max_ep_ret": f"{ep_return_max:.3f}", "kl_div": f"{kl_div:.4f}",
                 "clip_frac": f"{clip_frac:.3f}"
             })
 
-            if early_stop_reward is not None and ep_return >= early_stop_reward:
-                early_stop_count += 1
-                if early_stop_count == 3:
-                    pbar.close()
-                    print("Early stop reward reached.")
-                    break
-            else:
-                early_stop_count = 0
+            if early_stop_reward is not None and ep_return_max >= early_stop_reward:
+                pbar.close()
+                print("Early stop reward reached.")
+                break
 
         wandb.finish()
 
