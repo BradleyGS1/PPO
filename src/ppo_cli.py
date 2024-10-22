@@ -35,6 +35,7 @@ def main():
     parser.add_argument("--early_stop_reward", default=None, type=float, help="Float: The early stopping reward threshold")
 
     args = parser.parse_args()
+    print()
 
     env_module = importlib.import_module(args.env_module)
     env_fn = getattr(env_module, "train_fn")

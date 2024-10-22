@@ -1,6 +1,7 @@
 
 
 import gymnasium as gym
+import ale_py
 import numpy as np
 from collections import deque
 
@@ -25,8 +26,9 @@ class FrameStack(gym.Wrapper):
         return np.concatenate(self.frame_stack, axis=-1), reward, done, trunc, info
 
 def train_fn():
-    env = gym.make("BreakoutNoFrameskip-v4")
-    env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=10)
+    gym.register_envs(ale_py)
+    env = gym.make("ALE/Breakout-v5", frameskip=1, repeat_action_probability=0.0)
+    env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=100)
     env = gym.wrappers.AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=84, grayscale_obs=True, grayscale_newaxis=True, scale_obs=True)
     env = FrameStack(env, num_stack=4)
     return env
