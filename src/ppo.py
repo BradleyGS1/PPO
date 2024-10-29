@@ -8,10 +8,11 @@ import gymnasium as gym
 import wandb
 import time
 import tqdm
+import os
 
 from typing import Callable
 from datetime import datetime
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 
 class Agent(nn.Module):
@@ -21,6 +22,7 @@ class Agent(nn.Module):
         action_shape: tuple,
         conv_net: bool,
         joint_net: bool,
+        device: str
     ):
         super(Agent, self).__init__()
         self.state_shape = state_shape
@@ -33,7 +35,7 @@ class Agent(nn.Module):
         else:
             self.init_dense_net()
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device
         self.to(self.device, dtype=torch.float32)
 
     def init_layer(self, layer, std: float=np.sqrt(2)):
@@ -130,11 +132,30 @@ class SyncVecEnv:
         env_fn: Callable[[], gym.Env],
         num_envs: int,
         steps_per_env: int,
+        record_every: int,
+        render_fps: float,
         agent: Agent
     ):
         self.envs = [env_fn() for _ in range(num_envs)]
         self.num_envs = num_envs
         self.steps_per_env = steps_per_env
+        self.global_steps = 0
+
+        self.record_every = (record_every if record_every > 0 else 1)
+        self.can_record = record_every > 0
+        self.ready_to_record = False
+        self.is_recording = self.can_record
+        self.record_episode = 0
+        self.record_buffer = []
+        self.record_total_reward = 0.0
+        self.render_fps = render_fps
+        self.render_folder = "./renders/misc"
+        if self.can_record and wandb.run is not None:
+            project_name = wandb.run.project
+            run_name = wandb.run.name
+            self.render_folder = f"./renders/{project_name}/{run_name}"
+        os.makedirs(self.render_folder, exist_ok=True)
+
         self.agent = agent
 
         self.max_ep_return = np.float32(np.nan)
@@ -157,8 +178,8 @@ class SyncVecEnv:
             self.permute_state_fn = self.permute_state
             new_state_shape = (self.state_shape[2], self.state_shape[0], self.state_shape[1])
             self.state_shape = new_state_shape
-
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+        self.device = self.agent.device
         self.t_states = self.vec_reset()
 
     def permute_state(self, state: np.ndarray):
@@ -205,26 +226,6 @@ class SyncVecEnv:
 
         return states, rewards, done_flags, trunc_flags
 
-    def test_agent(self, render_every: int):
-        num_steps = self.steps_per_env
-        num_envs = self.num_envs
-        self.images = [[] for _ in range(num_envs)]
-
-        t_states = self.vec_reset()
-        pbar = tqdm.trange(num_steps)
-        pbar.set_description_str("Recording")
-        for t_step in pbar:
-
-            if t_step % render_every == 0:
-                for actor in range(num_envs):
-                    state_image = Image.fromarray(self.envs[actor].render(), mode="RGB")
-                    self.images[actor].append(state_image)
-
-            t_actions, _, _, _ = self.agent.get_actions_and_values(t_states, actions=None)
-            t_states, _, _, _ = self.vec_step(t_actions)
-
-        self.vec_reset()
-
     def rollout(self):
         with torch.no_grad():
             num_steps = self.steps_per_env
@@ -244,6 +245,20 @@ class SyncVecEnv:
 
             for t_step in range(num_steps):
 
+                # Record rendered observation from the first environment if recording
+                if self.is_recording:
+                    obs_render = self.envs[0].render().astype(np.uint8)
+                    obs_image = Image.fromarray(obs_render)
+
+                    draw = ImageDraw.Draw(obs_image)
+                    font = ImageFont.load_default()
+                    text = f"Total Reward: {self.record_total_reward}"
+                    position = (50, 40)
+                    text_color = (0, 204, 102)
+                    draw.text(position, text, text_color, font)
+
+                    self.record_buffer.append(obs_image) 
+
                 # Compute actions, log_probs and critic values for each env using their states
                 t_actions, t_log_probs, t_values, _  = self.agent.get_actions_and_values(self.t_states, actions=None)
 
@@ -257,12 +272,33 @@ class SyncVecEnv:
                     terminated = done + trunc
 
                     self.total_return += reward.cpu().numpy()
+                    if actor == 0:
+                        self.record_total_reward += reward.cpu().numpy()
 
                     can_reset = True
                     if terminated == 0 and t_step == num_steps - 1:
                         terminated += 1
                         t_truncs[actor] += 1
                         can_reset = False
+
+                    elif terminated > 0 and actor == 0:
+                        if self.is_recording:
+                            self.is_recording = False
+                            if len(self.record_buffer) > 1:
+                                self.record_buffer[0].save(
+                                        f"{self.render_folder}/render_{self.record_episode}.gif", 
+                                        save_all=True, 
+                                        append_images=self.record_buffer[1:], 
+                                        duration=1000/self.render_fps, 
+                                        loop=0)
+
+                            self.record_buffer = []
+                            self.record_episode += 1
+
+                        elif self.ready_to_record:
+                            self.ready_to_record = False
+                            self.is_recording = True
+                            self.record_total_reward = 0.0
 
                     if terminated > 0:
                         end_state = t_new_states[actor]
@@ -272,6 +308,12 @@ class SyncVecEnv:
                             t_new_states[actor] = self.env_reset(actor)
 
                         self.ep_counts[actor] += 1
+
+                    self.global_steps += 1
+
+                    ready_to_record = self.global_steps % self.record_every == self.record_every - 1
+                    if self.can_record and ready_to_record:
+                        self.ready_to_record = True
 
                 self.states[t_step] = self.t_states
                 self.actions[t_step] = t_actions
@@ -312,6 +354,7 @@ class PPO:
         clip_va_loss: bool,
         conv_net: bool,
         joint_network: bool,
+        use_gpu: bool,
         **kwargs
     ):
         self.discount_factor = discount_factor
@@ -320,13 +363,17 @@ class PPO:
         self.clip_va_loss = clip_va_loss
         self.conv_net = conv_net
         self.joint_network = joint_network
+        self.use_gpu = use_gpu
 
         self.project_name = kwargs.get("project_name", None)
 
         self.agent: Agent = None
         self.pi_optimizer: optim.optimizer.Optimizer = None
         self.va_optimizer: optim.optimizer.Optimizer = None
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.device = "cpu"
+        if use_gpu and torch.cuda.is_available():
+            self.device = "cuda"
 
         self.updates = 0
 
@@ -449,6 +496,7 @@ class PPO:
 
         # Perform multiple epochs of updates using the gathered data
         updates_start = time.time()
+        early_stop_updates = False
         clip_fracs = []
         grad_steps_done = 0
         for epoch in range(num_epochs):
@@ -505,11 +553,14 @@ class PPO:
                     nn.utils.clip_grad_norm_(self.agent.parameters(), max_grad_norm)
                     self.va_optimizer.step()
 
+                # Set the early stop updates flag to true if target_kl threshold exceeded
+                if target_div is not None and kl_div > target_div:
+                    early_stop_updates = True
+
                 clip_fracs.append(clip_frac.item())
                 grad_steps_done += 1
 
-            # Early stop the updates if target_kl threshold exceeded
-            if kl_div > target_div:
+            if early_stop_updates:
                 break
 
         updates_time = time.time() - updates_start
@@ -519,7 +570,7 @@ class PPO:
         policy_loss = policy_loss.item()
         critic_loss = critic_loss.item()
         entropy = entropy.item()
-        clip_frac = np.mean(clip_fracs, dtype=np.float32)
+        clip_frac = np.mean(clip_fracs, dtype=np.float32).item()
         kl_div = kl_div.item()
 
         rollout_return = vec_env.total_return.item() / num_envs
@@ -561,33 +612,24 @@ class PPO:
         critic_coef: float,
         entropy_coef: float,
         clip_ratio: float,
-        target_div: float,
         max_grad_norm: float,
         learning_rate: float,
+        target_div: float = None,
+        render_every: int = 0,
+        render_fps: float = 0.0,
         early_stop_reward: float = None
-    ):
-        test_env = env_fn()
-        state_shape = test_env.reset()[0].shape
-        action_shape = [test_env.action_space.n] # temporary
-        self.agent = Agent(state_shape, action_shape, conv_net=self.conv_net, joint_net=self.joint_network)
-
-        del test_env
-        vec_env = SyncVecEnv(env_fn, num_envs, steps_per_env, self.agent)
-
-        self.pi_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
-        self.va_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
-        lr_anneal = 1.0
-
+    ): 
         curr_datetime = datetime.now().strftime("%Y-%m-%d-%H-%M")
         if self.project_name is None:
             self.project_name = f"ppo_exp_{curr_datetime}"
-
+ 
         wandb.init(project=self.project_name, name=f"run-{curr_datetime}", reinit=True, config={
             "discount_factor": self.discount_factor,
             "gae_factor": self.gae_factor,
             "norm_adv": self.norm_adv,
             "clip_va_loss": self.clip_va_loss,
             "joint_network": self.joint_network,
+            "use_gpu": self.use_gpu,
             "num_updates": num_updates,
             "num_envs": num_envs,
             "steps_per_env": steps_per_env,
@@ -596,11 +638,25 @@ class PPO:
             "critic_coef": critic_coef,
             "entropy_coef": entropy_coef,
             "clip_ratio": clip_ratio,
-            "target_div": target_div,
             "max_grad_norm": max_grad_norm,
             "learning_rate": learning_rate,
+            "target_div": target_div,
+            "render_every": render_every,
+            "render_fps": render_fps,
             "early_stop_reward": early_stop_reward
         })
+
+        test_env = env_fn()
+        state_shape = test_env.reset()[0].shape
+        action_shape = [test_env.action_space.n] # temporary
+        self.agent = Agent(state_shape, action_shape, conv_net=self.conv_net, joint_net=self.joint_network, device=self.device)
+
+        del test_env
+        vec_env = SyncVecEnv(env_fn, num_envs, steps_per_env, render_every, render_fps, self.agent)
+
+        self.pi_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
+        self.va_optimizer = optim.Adam(self.agent.parameters(), lr=learning_rate, eps=1e-5)
+        lr_anneal = 1.0
 
         pbar = tqdm.trange(num_updates, leave=True)
         for update in pbar:
@@ -630,18 +686,3 @@ class PPO:
 
         wandb.finish()
 
-    def create_gif(self, env_fn: Callable[[], gym.Env], num_envs: int, max_steps: int, gif_fn: str, duration: int = 50, render_every: int = 1):
-        vec_env = SyncVecEnv(env_fn, num_envs, max_steps, self.agent)
-        vec_env.test_agent(render_every)
-        images = vec_env.images
-
-        for actor, actor_images in enumerate(images):
-            actor_images[0].save(
-                f"{gif_fn}-{actor}.gif",
-                save_all=True,
-                append_images=actor_images[1:],
-                duration=duration,
-                loop=0
-            )
-
-        return images

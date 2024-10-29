@@ -1,4 +1,3 @@
 *.ipynb
-*.gif
-src/wandb
+renders
 wandb

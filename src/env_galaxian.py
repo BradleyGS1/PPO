@@ -27,7 +27,7 @@ class FrameStack(gym.Wrapper):
 
 def train_fn():
     gym.register_envs(ale_py)
-    env = gym.make("ALE/Breakout-v5", render_mode="rgb_array", frameskip=1, repeat_action_probability=0.0)
+    env = gym.make("ALE/Galaxian-v5", render_mode="rgb_array", frameskip=1, repeat_action_probability=0.0)
     env = gym.wrappers.RecordEpisodeStatistics(env, deque_size=100)
     env = gym.wrappers.AtariPreprocessing(env, noop_max=30, frame_skip=4, screen_size=84, grayscale_obs=True, grayscale_newaxis=True, scale_obs=True)
     env = FrameStack(env, num_stack=4)

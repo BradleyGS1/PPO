@@ -23,7 +23,6 @@ def main():
     parser.add_argument("critic_coef", type=float, help="Float: The critic loss coefficient")
     parser.add_argument("entropy_coef", type=float, help="Float: The entropy loss coefficient")
     parser.add_argument("clip_ratio", type=float, help="Float: The clipping ratio in the PPO clip objective")
-    parser.add_argument("target_div", type=float, help="Float: The kl_div threshold, early stops the update step if exceeded")
     parser.add_argument("max_grad_norm", type=float, help="Float: The global gradient norm clipping value")
     parser.add_argument("learning_rate", type=float, help="Float: The learning rate for the Adam optimiser")
     parser.add_argument("discount_factor", type=float, help="Float: The discount factor")
@@ -32,7 +31,11 @@ def main():
     parser.add_argument("clip_va_loss", type=int, help="Bool: Set 1 to clip the critic loss like the policy")
     parser.add_argument("conv_net", type=int, help="Bool: Set 1 to use the convolutional network")
     parser.add_argument("joint_network", type=int, help="Bool: Set 1 to use a joint policy and value network backbone")
-    parser.add_argument("--early_stop_reward", default=None, type=float, help="Float: The early stopping reward threshold")
+    parser.add_argument("--use_gpu", default=False, type=int, help="Bool: Set 1 to use the gpu if Pytorch is properly setup to use CUDA (Default: 0)")
+    parser.add_argument("--target_div", default=None, type=float, help="Float: The kl_div threshold which early stops the current update step if exceeded (Default: None)")
+    parser.add_argument("--render_every", default=0, type=int, help="Int: Creates a gif of an episode every render_every global env steps (Default: 0)")
+    parser.add_argument("--render_fps", default=0.0, type=float, help="Float: Frames per second of the episode renders (Default: 0.0)")
+    parser.add_argument("--early_stop_reward", default=None, type=float, help="Float: The early stopping reward threshold (Default: None)")
 
     args = parser.parse_args()
     print()
@@ -47,7 +50,8 @@ def main():
             args.clip_va_loss,
             args.conv_net,
             args.joint_network,
-            project_name = args.experiment_name
+            args.use_gpu,
+            project_name=args.experiment_name
             )
 
     agent.train(
@@ -60,9 +64,11 @@ def main():
             args.critic_coef,
             args.entropy_coef,
             args.clip_ratio,
-            args.target_div,
             args.max_grad_norm,
             args.learning_rate,
+            args.target_div,
+            args.render_every,
+            args.render_fps,
             args.early_stop_reward
             )
 
