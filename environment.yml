@@ -14,9 +14,11 @@ dependencies:
     - tqdm==4.66.5
     - wandb==0.18.3
     - pillow==11.0.0
+    - pytest==8.3.3
     - ale-py==0.8.1
     - gymnasium==0.29.1
     - gymnasium[classic-control]==0.29.1
+    - gymnasium[mujoco]==0.29.1
     - gymnasium[atari]==0.29.1
     - gymnasium[other]
     - gymnasium[accept-rom-license]

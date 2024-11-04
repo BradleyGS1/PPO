@@ -5,65 +5,78 @@ import torch
 import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
-from ppo import Agent, VecEnv
+from ppo import Agent, SyncVecEnv
 
-
-def assert_shape_and_dtype(x: torch.Tensor, shape: list, dtype: torch.dtype):
-    assert x.size() == torch.Size(shape)
-    assert x.dtype == dtype
 
 def test_vec_env_states():
-    agent = Agent(state_shape=(4,), action_shape=(2,), conv_net=False, joint_net=True)
 
+    # Testing states shape upon vec env reset for a vector state space
     def env_fn():
         return gym.make("CartPole-v1")
 
-    vec_env = VecEnv(env_fn=env_fn, num_envs=2, steps_per_env=100, agent=agent)
-    states = vec_env.vec_env_states()
+    test_env = env_fn()
+    agent = Agent(test_env.observation_space, test_env.action_space, conv_net=0, joint_net=1, device="cpu")
 
-    assert_shape_and_dtype(states, shape=(2, 4), dtype=torch.float32)
+    vec_env = SyncVecEnv(env_fn, num_envs=6, steps_per_env=125, render_every=0, render_fps=0.0, agent=agent)
+    states = vec_env.vec_reset()
 
+    assert states.size() == torch.Size([6, 4])
+    assert states.dtype == torch.float32
 
-    agent = Agent(state_shape=(6,), action_shape=(4,), conv_net=False, joint_net=True)
-
+    # Testing states shape upon vec env reset for an image state space
     def env_fn():
-        return gym.make("Acrobot-v1")
+        return gym.make("ALE/Breakout-v5")
 
-    vec_env = VecEnv(env_fn=env_fn, num_envs=8, steps_per_env=100, agent=agent)
-    states = vec_env.vec_env_states()
+    test_env = env_fn()
+    agent = Agent(test_env.observation_space, test_env.action_space, conv_net=0, joint_net=1, device="cpu")
 
-    assert_shape_and_dtype(states, shape=(8, 6), dtype=torch.float32)
+    vec_env = SyncVecEnv(env_fn, num_envs=4, steps_per_env=125, render_every=0, render_fps=0.0, agent=agent)
+    states = vec_env.vec_reset()
 
-def test_vec_env_step():
-    agent = Agent(state_shape=(4,), action_shape=(2,), conv_net=False, joint_net=True)
-
-    def env_fn():
-        return gym.make("CartPole-v1")
-
-    vec_env = VecEnv(env_fn=env_fn, num_envs=2, steps_per_env=100, agent=agent)
-    states = vec_env.vec_env_states()
-    actions = agent.get_actions_and_values(states, actions=None)[0]
-    rewards, done_flags, trunc_flags = vec_env.vec_env_step(actions)
-
-    assert_shape_and_dtype(actions, shape=(2, ), dtype=torch.int32)
-    assert torch.equal(rewards, torch.tensor([1.0, 1.0], dtype=torch.float32, device="cuda"))
-    assert torch.equal(done_flags, torch.tensor([0, 0], dtype=torch.int32, device="cuda"))
-    assert torch.equal(trunc_flags, torch.tensor([0, 0], dtype=torch.int32, device="cuda"))
+    assert states.size() == torch.Size([4, 210, 160, 3])
+    assert states.dtype == torch.float32
 
 def test_vec_env_rollout():
-    agent = Agent(state_shape=(4,), action_shape=(2,), conv_net=False, joint_net=True)
 
+    def matching_shape_dtype(x: torch.Tensor, shape: tuple, dtype: torch.dtype):
+        assert x.size() == torch.Size(shape)
+        assert x.dtype == dtype
+
+    # Testing rollout shapes of vec env rollout for a vector state space and disrete action space
     def env_fn():
         return gym.make("CartPole-v1")
 
-    vec_env = VecEnv(env_fn=env_fn, num_envs=2, steps_per_env=100, agent=agent)
+    test_env = env_fn()
+    agent = Agent(test_env.observation_space, test_env.action_space, conv_net=0, joint_net=1, device="cpu")
+
+    vec_env = SyncVecEnv(env_fn, num_envs=2, steps_per_env=125, render_every=0, render_fps=0.0, agent=agent)
     vec_env.rollout()
 
     assert vec_env.states.requires_grad
-    assert_shape_and_dtype(vec_env.states, shape=(200, 4), dtype=torch.float32)
-    assert_shape_and_dtype(vec_env.actions, shape=(200, ), dtype=torch.int32)
-    assert_shape_and_dtype(vec_env.rewards, shape=(200, ), dtype=torch.float32)
-    assert_shape_and_dtype(vec_env.done_flags, shape=(200, ), dtype=torch.int32)
-    assert_shape_and_dtype(vec_env.trunc_flags, shape=(200, ), dtype=torch.int32)
-    assert_shape_and_dtype(vec_env.values, shape=(200, ), dtype=torch.float32)
-    assert_shape_and_dtype(vec_env.log_probs, shape=(200, ), dtype=torch.float32)
+    matching_shape_dtype(vec_env.states, (125, 2, 4), torch.float32)
+    matching_shape_dtype(vec_env.actions, (125, 2), torch.int32)
+    matching_shape_dtype(vec_env.rewards, (125, 2), torch.float32)
+    matching_shape_dtype(vec_env.done_flags, (125, 2), torch.int32)
+    matching_shape_dtype(vec_env.trunc_flags, (125, 2), torch.int32)
+    matching_shape_dtype(vec_env.values, (125, 2), torch.float32)
+    matching_shape_dtype(vec_env.log_probs, (125, 2), torch.float32)
+
+    # Testing rollout shapes of vec env rollout for a vector state space and continuous action space
+    def env_fn():
+        return gym.make("Ant-v4")
+
+    test_env = env_fn()
+    agent = Agent(test_env.observation_space, test_env.action_space, conv_net=0, joint_net=1, device="cpu")
+
+    vec_env = SyncVecEnv(env_fn, num_envs=3, steps_per_env=250, render_every=0, render_fps=0.0, agent=agent)
+    vec_env.rollout()
+
+    assert vec_env.states.requires_grad
+    matching_shape_dtype(vec_env.states, (250, 3, 27), torch.float32)
+    matching_shape_dtype(vec_env.actions, (250, 3, 8), torch.float32)
+    matching_shape_dtype(vec_env.rewards, (250, 3), torch.float32)
+    matching_shape_dtype(vec_env.done_flags, (250, 3), torch.int32)
+    matching_shape_dtype(vec_env.trunc_flags, (250, 3), torch.int32)
+    matching_shape_dtype(vec_env.values, (250, 3), torch.float32)
+    matching_shape_dtype(vec_env.log_probs, (250, 3), torch.float32)
+
